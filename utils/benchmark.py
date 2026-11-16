@@ -3,6 +3,7 @@ from statistics import mean
 import numpy as np
 from ai.rl.environment import WordleEnv
 from ai.rl.agents import EntropyAgent, RollOutAgent
+from ai.rl.mcts import MCTSAgent
 
 def evaluate(agent_class, answers, **kwargs):
     env = WordleEnv(render_mode="train")
@@ -54,13 +55,12 @@ def benchmark(n_games=20, seed=42):
     ).tolist()
     results = {}
     print("Evaluating Entropy Agent...", flush=True)
-    results["Entropy"] = evaluate(
-        EntropyAgent,
-        answers,
-        max_guesses=20,
-    )
+    results["Entropy"] = evaluate(EntropyAgent, answers, max_guesses=20)
     print("Evaluating Rollout Agent...", flush=True)
     results["Rollout"] = evaluate(RollOutAgent, answers, max_guesses=20, max_rollout_candidates=12)
+    print("Evaluating MCTS Agent...", flush=True)
+    results["MCTS"] = evaluate(MCTSAgent, answers, simulations=200, max_guesses=20, 
+                               max_actions=12, max_mcts_candidates=10, seed=seed)
     print("\n=== BENCHMARK RESULTS ===")
     for name, result in results.items():
         print(f"\n{name}")
