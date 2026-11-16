@@ -63,9 +63,11 @@ class WordleEnv(Wordle):
                 remaining[guess[i]] -= 1
         return tuple(colors)
 
-    def step(self, action:str): 
+    def step(self, action:str|None): 
         if self.done: 
             raise RuntimeError("Gameover. Call reset().")
+        if action is None: 
+            raise ValueError("No action")
         guess = action.strip().lower()
         if guess not in self.words: 
             raise ValueError(f"Invalid guess: {guess}")

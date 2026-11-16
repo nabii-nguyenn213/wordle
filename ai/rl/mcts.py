@@ -20,7 +20,9 @@ class BeliefNode:
 
 class MCTSAgent: 
     WIN = ("Green", )*5
-    def __init__(self, env: WordleEnv, simulations=200, max_guesses=20, max_actions=12, max_mcts_candidates=10, exploration=2.0, loss_penalty=6.0, seed=42): 
+    def __init__(self, env: WordleEnv, simulations=200, max_guesses=20, max_actions=12, 
+                 max_mcts_candidates=10, exploration=2.0, loss_penalty=6.0, seed:int|None=42, 
+                 value_model=None): 
         self.env = env
 
         self.base_agent = EntropyAgent(
@@ -35,6 +37,7 @@ class MCTSAgent:
         self.loss_penalty = loss_penalty
         self.rng = Random(seed)
         self.last_decision = {}
+        self.value_model = value_model
 
     @lru_cache(maxsize=300_000)
     def _feedback(self, guess, answer):
@@ -112,12 +115,18 @@ class MCTSAgent:
                 next_candidates = tuple(word for word in node.candidates if self._feedback(guess, word) == pattern)
                 child = self._new_node(next_candidates, node.remaining - 1)
                 stats.children[pattern] = child
-                # First visit: use rollout.
-                future_reward = self._rollout(
-                    next_candidates,
-                    child.remaining,
-                    hypothetical_answer,
-                )
+                # First visit: evaluate the newly expanded node.
+                if self.value_model is not None:
+                    future_reward = -self.value_model.predict_cost(
+                        next_candidates,
+                        child.remaining,
+                    )
+                else:
+                    future_reward = self._rollout(
+                        next_candidates,
+                        child.remaining,
+                        hypothetical_answer,
+                    )
             else:
                 # Existing branch: continue tree search.
                 future_reward = self._simulate(child, hypothetical_answer)

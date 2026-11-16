@@ -4,6 +4,7 @@ from utils.utils import read_dataset
 from ai.rl.environment import WordleEnv
 from ai.rl.agents import EntropyAgent, RollOutAgent
 from ai.rl.mcts import MCTSAgent
+from ai.rl.value import ValueEstimator
 
 # Test loading dataset
 def test_dataset_loading(): 
@@ -91,7 +92,7 @@ def test_mcts_agent(total_games=20, seed=None):
             max_guesses=20,
             max_actions=12,
             max_mcts_candidates=10,
-            seed=seed,
+            seed=seed
         )
         observation = env.reset(seed=42)
         done = False
@@ -120,9 +121,44 @@ def test_mcts_agent(total_games=20, seed=None):
         print("Total guesses:", len(env.colors_hist))
     print("Win rate:", number_of_win/total_games)
 
+def test_learned_mcts(total_games=20, seed=None):
+    number_of_win=0
+    for i in range(total_games): 
+        env = WordleEnv(render_mode="train", seed=seed)
+        checkpoint = "./results/wordle_value.pt"
+        value_model = ValueEstimator(env=env, checkpoint_path=checkpoint)
+        agent = MCTSAgent(
+            env=env,
+            simulations=200,
+            max_guesses=20,
+            max_actions=12,
+            max_mcts_candidates=10,
+            value_model=value_model,
+            seed=seed,
+        )
+        observation = env.reset(seed=seed)
+        done = False
+        while not done:
+            start = perf_counter()
+            guess = agent.select_action(observation)
+            elapsed = perf_counter() - start
+            observation, reward, done, info = env.step(guess)
+            print(
+                f"{guess} | "
+                f"Candidates: {info['candidate_count']} | "
+                f"Method: {agent.last_decision['method']} | "
+                f"Time: {elapsed:.3f}s"
+            )
+        print("Win:", info["win"])
+        if info["win"]:
+            number_of_win+=1
+        print("Total guesses:", len(env.colors_hist))
+    print("Win rate:", number_of_win/total_games)
+
 if __name__ == "__main__": 
     # test_dataset_loading()
     # test_wordle_env()
     # test_entropy_agent(total_games=20)
     # test_rollout_agent(total_games=20)
-    test_mcts_agent(total_games=20)
+    # test_mcts_agent(total_games=20)
+    test_learned_mcts(total_games=20)
