@@ -75,7 +75,7 @@ class WordleEnv(Wordle):
         idx = 6 - self.guess_remaining
         self.guessed_words[idx] = guess 
         self.colors_hist.append(colors)
-
+        self.guess_remaining -= 1
         # Update possible hidden answers 
         observed = tuple(colors)
         self.candidates = [word for word in self.candidates 

@@ -1,6 +1,7 @@
 import numpy 
 from utils.utils import read_dataset
 from ai.rl.environment import WordleEnv
+from ai.rl.agents import EntropyAgent
 
 # Test loading dataset
 def test_dataset_loading(): 
@@ -26,6 +27,30 @@ def test_wordle_env():
         print("Done:", done)
         print("Candidates left:", info["candidate_count"])
 
+def test_entropy_agent(total_games=10, seed=None): 
+    number_of_win=0
+    for i in range(total_games): 
+        env = WordleEnv(render_mode="rich", seed=seed)
+        agent = EntropyAgent(env=env, max_guesses=20)
+        observation = env.reset(seed=seed)
+        done = False 
+        while not done: 
+            guess = agent.select_action(observation)
+            observation, reward, done, info = env.step(action=guess)
+
+            print("Guess:", guess)
+            print("Feedback:", info["feedback"])
+            print("Candidates:", info["candidate_count"])
+            print("Reward:", reward)
+            print()
+
+        print("Win:", info["win"])
+        if info["win"]:
+            number_of_win+=1
+        print("Total guesses:", 6 - env.guess_remaining)
+    print("Win rate:", number_of_win/total_games)
+
 if __name__ == "__main__": 
     # test_dataset_loading()
-    test_wordle_env()
+    # test_wordle_env()
+    test_entropy_agent(total_games=20)
