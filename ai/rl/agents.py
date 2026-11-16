@@ -1,4 +1,5 @@
 import math 
+from functools import lru_cache
 from collections import Counter
 from ai.rl.environment import WordleEnv
 
@@ -51,4 +52,86 @@ class EntropyAgent:
             if score > best_score: 
                 best_score = score 
                 best_guess = guess
+        return best_guess
+
+class RollOutAgent: 
+    def __init__(self, env: WordleEnv, max_guesses=100, max_rollout_candidates=12, loss_penalty=6.0): 
+        self.env = env 
+        # Base policy used for future decision
+        self.base_agent = EntropyAgent(env, max_guesses)
+        self.max_rollout_candidates = max_rollout_candidates
+        self.loss_penalty = loss_penalty
+        self.last_decision = {}
+
+    @lru_cache(maxsize=200_000)
+    def _feedback(self, guess, answer): 
+        return tuple(self.env.simulate_feedback(guess, answer))
+
+    @lru_cache(maxsize=50_000)
+    def _partitions(self, candidates, guess): 
+        groups = {}
+        for answer in candidates: 
+            pattern = self._feedback(guess, answer)
+            groups.setdefault(pattern, []).append(answer)
+        return tuple((pattern, tuple(words)) for pattern, words in groups.items())
+
+    def _action_cost(self, candidates, remaining, guess): 
+        total = len(candidates)
+        cost = 1.0 
+        for pattern, group in self._partitions(candidates, guess): 
+            if pattern == ("Green", )*5: 
+                continue 
+            probability = len(group) / total
+            if remaining == 1:
+                # No guesses left after this wrong answer
+                future_cost = self.loss_penalty
+            else:
+                future_cost = self._policy_value(group, remaining - 1)
+            cost += probability * future_cost
+        return cost
+
+    @lru_cache(maxsize=50_000)
+    def _policy_value(self, candidates, remaining):
+        if remaining <= 0:
+            return self.loss_penalty
+        observation = {"candidates": list(candidates), "guesses_remaining": remaining}
+        guess = self.base_agent.select_action(observation)
+        return self._action_cost(candidates, remaining, guess)
+
+    def select_action(self, observation):
+        candidates = tuple(observation["candidates"])
+        remaining = observation["guesses_remaining"]
+        if not candidates:
+            raise ValueError("No candidates remaining")
+        # Always compute the baseline action
+        base_guess = self.base_agent.select_action(observation)
+        # Avoid expensive rollout on large belief states
+        if len(candidates) > self.max_rollout_candidates:
+            self.last_decision = {
+                "method": "entropy",
+                "evaluated": 0,
+            }
+            return base_guess
+        if len(candidates) == 1:
+            self.last_decision = {
+                "method": "direct",
+                "evaluated": 0,
+            }
+            return candidates[0]
+        # Include baseline guess to guarantee comparison
+        possible_guesses = list(dict.fromkeys([base_guess] + list(self.base_agent.get_possible_guesses(list(candidates)))))
+        best_guess = base_guess
+        best_cost = self._action_cost(candidates, remaining, base_guess)
+        for guess in possible_guesses:
+            if guess == base_guess:
+                continue
+            cost = self._action_cost(candidates, remaining, guess)
+            if cost < best_cost - 1e-12:
+                best_cost = cost
+                best_guess = guess
+        self.last_decision = {
+            "method": "rollout",
+            "evaluated": len(possible_guesses),
+            "expected_cost": best_cost,
+        }
         return best_guess
