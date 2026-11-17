@@ -1,840 +1,573 @@
 import argparse
 import csv
-from collections import Counter
 from pathlib import Path
-from time import perf_counter
-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-from ai.rl.environment import WordleEnv
-from ai.dl.policy import DeepWordleAgent
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-CONFIG = {
-    "Entropy DL": (
-        "entropy_demonstrations.npz",
-        "entropy_student.pt",
-    ),
-    "Rollout DL": (
-        "rollout_demonstrations.npz",
-        "rollout_student.pt",
-    ),
-    "MCTS DL": (
-        "learned-mcts_demonstrations.npz",
-        "mcts_student.pt",
-    ),
+FILES = {
+    "Entropy DL": "entropy_student_history.csv",
+    "Rollout DL": "rollout_student_history.csv",
+    "MCTS DL": "mcts_student_history.csv",
 }
 
+METRICS = (
+    "epoch",
+    "train_ce",
+    "val_ce",
+    "train_sampled_top1",
+    "val_sampled_top1",
+    "val_sampled_top5",
+    "val_sampled_mrr",
+    "best_val_ce",
+    "best_epoch",
+    "learning_rate",
+)
+
 
 # ============================================================
-# 1. LOAD COLLECTED TEACHER DATASETS
+# 1. LOAD TRAINING HISTORIES
 # ============================================================
 
-def load_datasets(data_dir):
-    datasets = {}
-    excluded = set()
-    vocabulary = None
+def load_histories(input_dir):
+    histories = {}
 
-    for name, (dataset_name, _) in CONFIG.items():
-        path = data_dir / dataset_name
+    for name, filename in FILES.items():
+        path = input_dir / filename
 
-        if not path.exists():
-            print(f"[Missing dataset] {path}")
-            continue
-
-        with np.load(path, allow_pickle=False) as data:
-            words = tuple(
-                data["vocabulary"].astype(str)
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Missing history file: {path}"
             )
 
-            if vocabulary is None:
-                vocabulary = words
+        with path.open(
+            newline="",
+            encoding="utf-8-sig",
+        ) as stream:
+            reader = csv.DictReader(stream)
 
-            elif vocabulary != words:
+            missing = (
+                set(METRICS)
+                - set(reader.fieldnames or ())
+            )
+
+            if missing:
                 raise ValueError(
-                    "Teacher datasets use different "
-                    "word lists or ordering."
+                    f"{path}: missing columns {sorted(missing)}"
                 )
 
-            # Exclude every answer used by any teacher.
-            for key in (
-                "train_answers",
-                "val_answers",
-                "test_answers",
-            ):
-                excluded.update(
-                    data[key].astype(str).tolist()
-                )
+            records = list(reader)
 
-            methods = Counter(
-                data["method"].astype(str).tolist()
+        if not records:
+            raise ValueError(
+                f"{path}: empty training history"
             )
 
-            datasets[name] = {
-                "count": len(data["y"]),
-                "methods": methods,
-                "candidate_count": (
-                    data["candidate_count"].copy()
-                ),
-                "remaining": (
-                    data["remaining"].copy()
-                ),
-            }
+        history = {
+            key: np.asarray(
+                [float(row[key]) for row in records]
+            )
+            for key in METRICS
+        }
 
-    return datasets, excluded, vocabulary
+        if any(
+            not np.isfinite(values).all()
+            for values in history.values()
+        ):
+            raise ValueError(
+                f"{path}: NaN or Infinity detected"
+            )
+
+        histories[name] = history
+
+    return histories
+
+
+def best_row(history):
+    """Locate the minimum validation CE epoch."""
+    return int(np.argmin(history["val_ce"]))
 
 
 # ============================================================
-# 2. PLOT DATASET STATISTICS
+# 2. PLOTTING UTILITIES
 # ============================================================
 
-def plot_dataset_summary(datasets, output_dir):
-    if not datasets:
-        return
+def setup_axis(
+    ax,
+    title,
+    ylabel,
+    percentage=False,
+    log_scale=False,
+):
+    ax.set_title(title, weight="bold")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.24)
 
-    names = list(datasets)
+    if percentage:
+        ax.set_ylim(0, 102)
 
-    fig, axes = plt.subplots(
-        1, 2,
-        figsize=(14, 5),
-        constrained_layout=True,
-    )
+    if log_scale:
+        ax.set_yscale("log")
 
-    # Number of demonstrations
-    amounts = [
-        datasets[name]["count"]
-        for name in names
-    ]
 
-    bars = axes[0].bar(names, amounts)
+def draw_metric(
+    ax,
+    histories,
+    key,
+    title,
+    ylabel,
+    percent=False,
+    log_scale=False,
+    show_best=False,
+):
+    for name, history in histories.items():
+        epochs = history["epoch"]
 
-    axes[0].bar_label(
-        bars,
-        padding=3,
-    )
-
-    axes[0].set_title(
-        "Unique State-Action Demonstrations"
-    )
-    axes[0].set_ylabel(
-        "Number of samples"
-    )
-    axes[0].tick_params(
-        axis="x",
-        rotation=15,
-    )
-
-    # Teacher decision methods
-    all_methods = sorted(
-        set().union(
-            *(
-                data["methods"]
-                for data in datasets.values()
-            )
+        values = history[key] * (
+            100 if percent else 1
         )
-    )
 
-    bottoms = np.zeros(len(names))
-
-    for method in all_methods:
-        values = np.array([
-            datasets[name]["methods"].get(
-                method, 0
-            )
-            for name in names
-        ])
-
-        axes[1].bar(
-            names,
+        line, = ax.plot(
+            epochs,
             values,
-            bottom=bottoms,
-            label=method,
+            label=name,
+            linewidth=1.9,
         )
 
-        bottoms += values
+        if show_best:
+            i = best_row(history)
 
-    axes[1].set_title(
-        "Recorded Teacher Decision Methods"
-    )
-    axes[1].set_ylabel(
-        "Number of unique states"
-    )
-    axes[1].tick_params(
-        axis="x",
-        rotation=15,
+            ax.scatter(
+                epochs[i],
+                values[i],
+                marker="*",
+                s=125,
+                color=line.get_color(),
+                edgecolors="white",
+                zorder=5,
+            )
+
+    setup_axis(
+        ax,
+        title,
+        ylabel,
+        percentage=percent,
+        log_scale=log_scale,
     )
 
-    if all_methods:
-        axes[1].legend(fontsize=8)
+    ax.legend(
+        fontsize=8,
+        frameon=False,
+    )
+
+
+def save(fig, output_dir, filename, dpi):
+    path = output_dir / filename
 
     fig.savefig(
-        output_dir / "teacher_datasets.png",
-        dpi=180,
+        path,
+        dpi=dpi,
+        bbox_inches="tight",
     )
 
     plt.close(fig)
+    print("Saved:", path)
 
 
 # ============================================================
-# 3. PLOT TRAINING AND VALIDATION CURVES
+# 3. COMPLETE DASHBOARD
 # ============================================================
 
-def plot_learning_curves(models_dir, output_dir):
-    histories = {}
-
-    for name, (_, filename) in CONFIG.items():
-        history_path = (
-            models_dir
-            / filename.replace(
-                ".pt",
-                "_history.csv",
-            )
-        )
-
-        if not history_path.exists():
-            print(
-                f"[No history] {history_path}"
-            )
-            continue
-
-        with history_path.open(newline="") as file:
-            rows = list(csv.DictReader(file))
-
-        if rows:
-            histories[name] = rows
-
-    if not histories:
-        print(
-            "No training histories found. "
-            "Skipping training curves."
-        )
-        return
-
+def plot_dashboard(histories, output_dir, dpi):
     fig, axes = plt.subplots(
-        1, 2,
+        3,
+        2,
+        figsize=(15, 13),
+        constrained_layout=True,
+    )
+
+    specs = [
+        (
+            "train_ce",
+            "Training Cross-Entropy",
+            "Cross-Entropy",
+            False, True, False,
+        ),
+        (
+            "val_ce",
+            "Validation Cross-Entropy (Stars = Best)",
+            "Cross-Entropy",
+            False, True, True,
+        ),
+        (
+            "train_sampled_top1",
+            "Training Sampled Top-1",
+            "Agreement (%)",
+            True, False, False,
+        ),
+        (
+            "val_sampled_top1",
+            "Validation Sampled Top-1",
+            "Agreement (%)",
+            True, False, False,
+        ),
+        (
+            "val_sampled_top5",
+            "Validation Sampled Top-5",
+            "Agreement (%)",
+            True, False, False,
+        ),
+        (
+            "val_sampled_mrr",
+            "Validation Sampled MRR",
+            "Mean Reciprocal Rank",
+            False, False, False,
+        ),
+    ]
+
+    for ax, spec in zip(axes.flat, specs):
+        (
+            key,
+            title,
+            ylabel,
+            percent,
+            log_scale,
+            show_best,
+        ) = spec
+
+        draw_metric(
+            ax,
+            histories,
+            key,
+            title,
+            ylabel,
+            percent=percent,
+            log_scale=log_scale,
+            show_best=show_best,
+        )
+
+    axes[2, 1].set_ylim(0, 1.02)
+
+    fig.suptitle(
+        "Wordle - Deep Learning Training Metrics",
+        fontsize=17,
+        weight="bold",
+    )
+
+    save(
+        fig,
+        output_dir,
+        "training_dashboard.png",
+        dpi,
+    )
+
+
+# ============================================================
+# 4. CROSS-ENTROPY LOSS
+# ============================================================
+
+def plot_loss(histories, output_dir, dpi):
+    fig, axes = plt.subplots(
+        1,
+        2,
         figsize=(14, 5),
         constrained_layout=True,
     )
 
-    for name, rows in histories.items():
-        epochs = [
-            int(row["epoch"])
-            for row in rows
-        ]
+    draw_metric(
+        axes[0],
+        histories,
+        "train_ce",
+        "Training Cross-Entropy",
+        "Cross-Entropy (log scale)",
+        log_scale=True,
+    )
 
-        train_loss = [
-            float(row["train_ce"])
-            for row in rows
-        ]
+    draw_metric(
+        axes[1],
+        histories,
+        "val_ce",
+        "Validation Cross-Entropy",
+        "Cross-Entropy (log scale)",
+        log_scale=True,
+        show_best=True,
+    )
 
-        val_loss = [
-            float(row["val_ce"])
-            for row in rows
-        ]
+    save(
+        fig,
+        output_dir,
+        "loss_curves.png",
+        dpi,
+    )
 
-        val_accuracy = [
-            100 * float(
-                row["val_sampled_top1"]
-            )
-            for row in rows
-        ]
 
-        axes[0].plot(
-            epochs,
-            train_loss,
-            label=f"{name} Train",
+# ============================================================
+# 5. TOP-1 AGREEMENT
+# ============================================================
+
+def plot_accuracy(histories, output_dir, dpi):
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(14, 5),
+        constrained_layout=True,
+    )
+
+    draw_metric(
+        axes[0],
+        histories,
+        "train_sampled_top1",
+        "Training Sampled Top-1",
+        "Agreement (%)",
+        percent=True,
+    )
+
+    draw_metric(
+        axes[1],
+        histories,
+        "val_sampled_top1",
+        "Validation Sampled Top-1",
+        "Agreement (%)",
+        percent=True,
+    )
+
+    save(
+        fig,
+        output_dir,
+        "top1_agreement.png",
+        dpi,
+    )
+
+
+# ============================================================
+# 6. TOP-5 AND MRR
+# ============================================================
+
+def plot_ranking(histories, output_dir, dpi):
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(14, 5),
+        constrained_layout=True,
+    )
+
+    draw_metric(
+        axes[0],
+        histories,
+        "val_sampled_top5",
+        "Validation Sampled Top-5",
+        "Agreement (%)",
+        percent=True,
+    )
+
+    draw_metric(
+        axes[1],
+        histories,
+        "val_sampled_mrr",
+        "Validation Sampled MRR",
+        "Mean Reciprocal Rank",
+    )
+
+    axes[1].set_ylim(0, 1.02)
+
+    save(
+        fig,
+        output_dir,
+        "top5_and_mrr.png",
+        dpi,
+    )
+
+
+# ============================================================
+# 7. GENERALIZATION GAP
+# ============================================================
+
+def plot_gap(histories, output_dir, dpi):
+    fig, ax = plt.subplots(
+        figsize=(9, 5),
+        constrained_layout=True,
+    )
+
+    for name, history in histories.items():
+        gap = (
+            history["val_ce"]
+            - history["train_ce"]
         )
 
-        axes[0].plot(
-            epochs,
-            val_loss,
-            linestyle="--",
-            label=f"{name} Val",
-        )
-
-        axes[1].plot(
-            epochs,
-            val_accuracy,
+        ax.plot(
+            history["epoch"],
+            gap,
+            linewidth=1.9,
             label=name,
         )
 
-    axes[0].set_title(
-        "Policy Imitation Loss"
-    )
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Cross-Entropy")
-    axes[0].legend(fontsize=8)
-
-    axes[1].set_title(
-        "Validation Agreement (Sampled Actions)"
-    )
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel(
-        "Teacher Action Top-1 (%)"
-    )
-    axes[1].set_ylim(0, 100)
-    axes[1].legend(fontsize=8)
-
-    fig.savefig(
-        output_dir / "training_curves.png",
-        dpi=180,
+    ax.axhline(
+        0,
+        color="grey",
+        linestyle="--",
+        linewidth=1,
     )
 
-    plt.close(fig)
+    setup_axis(
+        ax,
+        "Cross-Entropy Generalization Gap",
+        "Validation CE - Training CE",
+    )
+
+    ax.legend(frameon=False)
+
+    save(
+        fig,
+        output_dir,
+        "generalization_gap.png",
+        dpi,
+    )
 
 
 # ============================================================
-# 4. CREATE A COMMON UNSEEN TEST SET
+# 8. SAVE BEST MODEL METRICS
 # ============================================================
 
-def common_test_answers(
-    env,
-    excluded,
-    games,
-    seed,
-):
-    # No hidden answer from any teacher dataset.
-    eligible = sorted(
-        set(env.words) - excluded
-    )
-
-    if not eligible:
-        raise ValueError(
-            "No unused answers available "
-            "for shared evaluation."
-        )
-
-    rng = np.random.default_rng(seed)
-
-    count = min(
-        games,
-        len(eligible),
-    )
-
-    if count < games:
-        print(
-            f"[Warning] Only {count} "
-            "unseen answers available."
-        )
-
-    selected = rng.choice(
-        eligible,
-        size=count,
-        replace=False,
-    ).tolist()
-
-    print(
-        f"Shared test answers: {len(selected)} "
-        f"(excluded {len(excluded)} "
-        "previously recorded answers)"
-    )
-
-    return selected
-
-
-# ============================================================
-# 5. EVALUATE THE THREE STUDENT AGENTS
-# ============================================================
-
-def evaluate_students(
-    env,
-    models_dir,
-    answers,
-):
-    logs = []
-
-    for name, (_, filename) in CONFIG.items():
-        checkpoint = models_dir / filename
-
-        if not checkpoint.exists():
-            print(
-                f"[Missing model] {checkpoint}"
-            )
-            continue
-
-        student = DeepWordleAgent(
-            env,
-            checkpoint=str(checkpoint),
-        )
-
-        print(
-            f"\nEvaluating {name} "
-            f"on {len(answers)} answers...",
-            flush=True,
-        )
-
-        for index, answer in enumerate(
-            answers, 1
-        ):
-            observation = env.reset(
-                answer=answer
-            )
-
-            guessed = set()
-            timings = []
-            done = False
-
-            while not done:
-                start = perf_counter()
-
-                action = student.select_action(
-                    observation,
-                    exclude_guesses=guessed,
-                )
-
-                elapsed_ms = (
-                    perf_counter() - start
-                ) * 1000
-
-                timings.append(elapsed_ms)
-                guessed.add(action)
-
-                (
-                    observation,
-                    reward,
-                    done,
-                    info,
-                ) = env.step(action)
-
-            win = bool(info["win"])
-
-            guesses = len(
-                env.colors_hist
-            )
-
-            logs.append({
-                "model": name,
-                "answer": answer,
-                "win": int(win),
-                "guesses": guesses,
-                "penalized_guesses": (
-                    guesses if win else 7
-                ),
-                "mean_decision_ms": float(
-                    np.mean(timings)
-                ),
-                "total_decision_ms": float(
-                    np.sum(timings)
-                ),
-                "decisions": len(timings),
-            })
-
-            if (
-                index % 50 == 0
-                or index == len(answers)
-            ):
-                print(
-                    f"  {index}/{len(answers)}",
-                    flush=True,
-                )
-
-    return logs
-
-
-# ============================================================
-# 6. COMPUTE GAMEPLAY METRICS
-# ============================================================
-
-def summarize(logs):
+def save_summary(histories, output_dir):
     rows = []
 
-    for model in CONFIG:
-        games = [
-            game for game in logs
-            if game["model"] == model
-        ]
-
-        if not games:
-            continue
-
-        won = [
-            game for game in games
-            if game["win"]
-        ]
-
-        win_rate = (
-            len(won) / len(games)
-        )
-
-        avg_winning_guesses = (
-            float(np.mean([
-                game["guesses"]
-                for game in won
-            ]))
-            if won else float("nan")
-        )
-
-        avg_penalty = float(
-            np.mean([
-                game["penalized_guesses"]
-                for game in games
-            ])
-        )
-
-        avg_latency = (
-            sum(
-                game["total_decision_ms"]
-                for game in games
-            )
-            / sum(
-                game["decisions"]
-                for game in games
-            )
-        )
+    for name, history in histories.items():
+        i = best_row(history)
 
         rows.append({
-            "model": model,
-            "games": len(games),
-            "wins": len(won),
-            "win_rate": win_rate,
-            "avg_guesses_on_wins": (
-                avg_winning_guesses
+            "model": name,
+            "epochs_ran": len(history["epoch"]),
+            "best_epoch": int(history["epoch"][i]),
+            "best_val_ce": float(
+                history["val_ce"][i]
             ),
-            "avg_penalized_guesses": (
-                avg_penalty
+            "train_ce_at_best": float(
+                history["train_ce"][i]
             ),
-            "avg_decision_ms": avg_latency,
+            "val_sampled_top1_at_best": float(
+                history["val_sampled_top1"][i]
+            ),
+            "val_sampled_top5_at_best": float(
+                history["val_sampled_top5"][i]
+            ),
+            "val_sampled_mrr_at_best": float(
+                history["val_sampled_mrr"][i]
+            ),
+            "learning_rate_at_best": float(
+                history["learning_rate"][i]
+            ),
         })
 
-    return rows
-
-
-def save_csv(path, rows):
-    if not rows:
-        return
+    path = output_dir / "metrics_summary.csv"
 
     with path.open(
         "w",
         newline="",
-    ) as file:
+        encoding="utf-8",
+    ) as stream:
         writer = csv.DictWriter(
-            file,
-            fieldnames=list(rows[0]),
+            stream,
+            fieldnames=rows[0].keys(),
         )
 
         writer.writeheader()
         writer.writerows(rows)
 
+    print("\nBEST-CHECKPOINT METRICS")
 
-# ============================================================
-# 7. PLOT GAMEPLAY BENCHMARK
-# ============================================================
-
-def plot_gameplay(
-    summary,
-    logs,
-    output_dir,
-):
-    if not summary:
-        return
-
-    names = [
-        row["model"]
-        for row in summary
-    ]
-
-    fig, axes = plt.subplots(
-        2, 2,
-        figsize=(13, 9),
-        constrained_layout=True,
-    )
-
-    metrics = [
-        (
-            "win_rate",
-            "Win Rate",
-            "Percent",
-            100,
-        ),
-        (
-            "avg_guesses_on_wins",
-            "Guesses on Successful Games",
-            "Guesses (lower is better)",
-            1,
-        ),
-        (
-            "avg_penalized_guesses",
-            "Penalized Guesses (Failure = 7)",
-            "Score (lower is better)",
-            1,
-        ),
-        (
-            "avg_decision_ms",
-            "Average Decision Time",
-            "Milliseconds (lower is better)",
-            1,
-        ),
-    ]
-
-    for ax, (
-        field,
-        title,
-        ylabel,
-        multiplier,
-    ) in zip(axes.flat, metrics):
-
-        values = [
-            row[field] * multiplier
-            for row in summary
-        ]
-
-        bars = ax.bar(
-            names,
-            values,
+    for row in rows:
+        print(
+            f"{row['model']:<12} "
+            f"epoch={row['best_epoch']:>3}  "
+            f"val CE={row['best_val_ce']:.4f}  "
+            f"Top-1={row['val_sampled_top1_at_best']:.2%}  "
+            f"Top-5={row['val_sampled_top5_at_best']:.2%}  "
+            f"MRR={row['val_sampled_mrr_at_best']:.4f}"
         )
 
-        ax.set_title(title)
-        ax.set_ylabel(ylabel)
-        ax.set_ylim(bottom=0)
-        ax.tick_params(
-            axis="x",
-            rotation=10,
-        )
-
-        labels = [
-            f"{value:.1f}"
-            if np.isfinite(value)
-            else "N/A"
-            for value in values
-        ]
-
-        ax.bar_label(
-            bars,
-            labels=labels,
-            padding=3,
-        )
-
-    fig.suptitle(
-        "Wordle Students: Common Unseen Test Set"
-    )
-
-    fig.savefig(
-        output_dir / "student_benchmark.png",
-        dpi=180,
-    )
-
-    plt.close(fig)
-
-    # --------------------------------------------------------
-    # Guess distribution
-    # --------------------------------------------------------
-
-    fig, ax = plt.subplots(
-        figsize=(11, 5),
-        constrained_layout=True,
-    )
-
-    x = np.arange(1, 8)
-    bar_width = 0.8 / len(names)
-
-    for index, name in enumerate(names):
-        selected = [
-            row for row in logs
-            if row["model"] == name
-        ]
-
-        counts = [
-            sum(
-                row["penalized_guesses"] == n
-                for row in selected
-            )
-            for n in x
-        ]
-
-        positions = (
-            x - 0.4
-            + bar_width * (index + 0.5)
-        )
-
-        ax.bar(
-            positions,
-            counts,
-            width=bar_width,
-            label=name,
-        )
-
-    ax.set_xticks(
-        x,
-        ["1", "2", "3", "4", "5", "6", "Failure"],
-    )
-
-    ax.set_xlabel("Number of Guesses")
-    ax.set_ylabel("Number of Games")
-    ax.set_title(
-        "Solve Attempts and Failures"
-    )
-
-    ax.legend()
-
-    fig.savefig(
-        output_dir / "guess_distribution.png",
-        dpi=180,
-    )
-
-    plt.close(fig)
+    print("Saved:", path)
 
 
 # ============================================================
-# 8. MAIN
+# 9. MAIN
 # ============================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description=(
-            "Plot Wordle training and "
-            "student evaluation results"
-        )
+        description="Plot Wordle DL training metrics"
     )
 
     parser.add_argument(
-        "--data-dir",
-        default="dataset/data_from_rl",
-    )
-
-    parser.add_argument(
-        "--models-dir",
-        default="results",
+        "--input-dir",
+        type=Path,
+        default=Path("./results/dl_checkpoints/"),
     )
 
     parser.add_argument(
         "--output-dir",
-        default="results/dl_plots",
+        type=Path,
+        default=Path("./results/dl_plots/"),
     )
 
     parser.add_argument(
-        "--games",
+        "--dpi",
         type=int,
         default=200,
     )
 
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=2026,
-    )
-
-    parser.add_argument(
-        "--skip-eval",
-        action="store_true",
-        help=(
-            "Plot saved datasets and "
-            "histories without playing games"
-        ),
-    )
     args = parser.parse_args()
-    if args.games < 1:
-        parser.error(
-            "--games must be positive"
-        )
 
-    data_dir = Path(
-        args.data_dir
-    )
+    if args.dpi <= 0:
+        parser.error("--dpi must be positive")
 
-    models_dir = Path(
-        args.models_dir
-    )
+    histories = load_histories(args.input_dir)
 
-    output_dir = Path(
-        args.output_dir
-    )
-
-    output_dir.mkdir(
+    args.output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    # 1. Teacher data statistics
-    datasets, excluded, vocabulary = (
-        load_datasets(data_dir)
+    plt.rcParams.update({
+        "font.size": 10,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+    })
+
+    plot_dashboard(
+        histories,
+        args.output_dir,
+        args.dpi,
     )
 
-    plot_dataset_summary(
-        datasets,
-        output_dir,
+    plot_loss(
+        histories,
+        args.output_dir,
+        args.dpi,
     )
 
-    # 2. Training histories, if saved
-    plot_learning_curves(
-        models_dir,
-        output_dir,
+    plot_accuracy(
+        histories,
+        args.output_dir,
+        args.dpi,
     )
 
-    # 3. Common held-out gameplay test
-    if not args.skip_eval:
-        if not datasets:
-            raise FileNotFoundError(
-                "No teacher datasets found. "
-                "Cannot create unseen test set."
-            )
+    plot_ranking(
+        histories,
+        args.output_dir,
+        args.dpi,
+    )
 
-        env = WordleEnv(
-            render_mode="train",
-            seed=args.seed,
-        )
+    plot_gap(
+        histories,
+        args.output_dir,
+        args.dpi,
+    )
 
-        if tuple(env.words) != vocabulary:
-            raise ValueError(
-                "Current environment vocabulary "
-                "differs from teacher datasets."
-            )
-
-        answers = common_test_answers(
-            env,
-            excluded,
-            args.games,
-            args.seed,
-        )
-
-        logs = evaluate_students(
-            env,
-            models_dir,
-            answers,
-        )
-
-        summary = summarize(logs)
-
-        save_csv(
-            output_dir / "gameplay_per_game.csv",
-            logs,
-        )
-
-        save_csv(
-            output_dir / "student_summary.csv",
-            summary,
-        )
-
-        plot_gameplay(
-            summary,
-            logs,
-            output_dir,
-        )
-
-        print("\n=== STUDENT PERFORMANCE ===")
-
-        for row in summary:
-            print(
-                f"\n{row['model']}"
-                f"\n  Win rate: "
-                f"{row['win_rate']:.2%}"
-                f"\n  Avg guesses on wins: "
-                f"{row['avg_guesses_on_wins']:.3f}"
-                f"\n  Penalized guesses: "
-                f"{row['avg_penalized_guesses']:.3f}"
-                f"\n  Decision latency: "
-                f"{row['avg_decision_ms']:.2f} ms"
-            )
-
-    print(
-        "\nPlots and CSVs saved to:",
-        output_dir.resolve(),
+    save_summary(
+        histories,
+        args.output_dir,
     )
 
 
